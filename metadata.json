@@ -1,0 +1,7 @@
+{
+  "name": "大拜计数器",
+  "description": "基于本地姿态识别的大拜计数工具。",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
