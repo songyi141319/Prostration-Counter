@@ -82,15 +82,15 @@ const DEFAULT_TUNING_SETTINGS: TuningSettings = {
   stableFrameCount: 4,
   frontStableDelta: 0.009,
   sideStableDelta: 0.012,
-  ritualMinAmplitudeFront: 0.18,
-  ritualMinAmplitudeSide: 0.16,
-  prostrationMinAmplitudeFront: 0.12,
-  prostrationMinAmplitudeSide: 0.1,
+  ritualMinAmplitudeFront: 0.12,
+  ritualMinAmplitudeSide: 0.1,
+  prostrationMinAmplitudeFront: 0.08,
+  prostrationMinAmplitudeSide: 0.06,
   ritualBottomDepthBias: 1,
   prostrationBottomDepthBias: 1,
   recoveryBias: 1,
-  phaseTimeoutRitualMs: 5200,
-  phaseTimeoutProstrationMs: 3600,
+  phaseTimeoutRitualMs: 10000,
+  phaseTimeoutProstrationMs: 6000,
 };
 const TUNING_SECTIONS: Array<{hint: string; title: string; fields: TuningField[]}> = [
   {
@@ -273,6 +273,7 @@ export default function KowtowCounter() {
   const minNoseYRef = useRef(1.0);
   const maxNoseYRef = useRef(0.0);
   const rotatedCanvasRef = useRef<OffscreenCanvas | null>(null);
+  const isBowedRef = useRef(false);
 
   const [viewport, setViewport] = useState(getViewportSize);
   const [count, setCount] = useState(0);
@@ -296,6 +297,7 @@ export default function KowtowCounter() {
   const [customToneGap, setCustomToneGap] = useState('160');
   const [playCountTickSound, setPlayCountTickSound] = useState(true);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [showDebug, setShowDebug] = useState(false);
   const [tuning, setTuning] = useState<TuningSettings>(DEFAULT_TUNING_SETTINGS);
 
   const isLandscapeViewport = viewport.width > viewport.height;
@@ -473,6 +475,13 @@ export default function KowtowCounter() {
     }
   }, []);
 
+  const updateBowed = useCallback((value: boolean) => {
+    if (isBowedRef.current !== value) {
+      isBowedRef.current = value;
+      setIsBowed(value);
+    }
+  }, []);
+
   const recalibrateMotionTracking = useCallback((baseNoseY?: number) => {
     motionPhaseRef.current = 'READY';
     cycleArmedRef.current = false;
@@ -490,7 +499,7 @@ export default function KowtowCounter() {
     maxNoseYRef.current = typeof baseNoseY === 'number' ? baseNoseY : 0.0;
     lastCalibrationAtRef.current = performance.now();
     phaseStartedAtRef.current = lastCalibrationAtRef.current;
-    setIsBowed(false);
+    updateBowed(false);
   }, []);
 
   const resetMotionTracking = useCallback(() => {
@@ -708,7 +717,12 @@ export default function KowtowCounter() {
           const leftShoulder = landmarks[11];
           const rightShoulder = landmarks[12];
 
-          if (nose && leftShoulder && rightShoulder) {
+          const noseVis = nose?.visibility ?? 0;
+          const lShoulderVis = leftShoulder?.visibility ?? 0;
+          const rShoulderVis = rightShoulder?.visibility ?? 0;
+          const landmarkReliable = noseVis > 0.5 && (lShoulderVis > 0.5 || rShoulderVis > 0.5);
+
+          if (nose && leftShoulder && rightShoulder && landmarkReliable) {
             const now = performance.now();
             const leftShoulderVisibility = leftShoulder.visibility ?? 0;
             const rightShoulderVisibility = rightShoulder.visibility ?? 0;
@@ -721,7 +735,7 @@ export default function KowtowCounter() {
             const filteredNoseY =
               smoothedNoseYRef.current === null
                 ? nose.y
-                : smoothedNoseYRef.current * 0.72 + nose.y * 0.28;
+                : smoothedNoseYRef.current * 0.5 + nose.y * 0.5;
 
             smoothedNoseYRef.current = filteredNoseY;
             const noseDelta =
@@ -766,8 +780,8 @@ export default function KowtowCounter() {
               minNoseYRef.current +
               amplitude *
                 (perspectiveMode === 'side'
-                  ? 0.24 * tuning.recoveryBias
-                  : 0.2 * tuning.recoveryBias);
+                  ? 0.35 * tuning.recoveryBias
+                  : 0.3 * tuning.recoveryBias);
             const bowThreshold =
               minNoseYRef.current + amplitude * (perspectiveMode === 'side' ? 0.33 : 0.36);
             const kneelingThreshold =
@@ -796,19 +810,13 @@ export default function KowtowCounter() {
                 (perspectiveMode === 'side'
                   ? 0.08 * tuning.prostrationBottomDepthBias
                   : 0.06 * tuning.prostrationBottomDepthBias);
-            const standingPose =
-              filteredNoseY <= standingThreshold &&
-              filteredNoseY < shoulderY - (perspectiveMode === 'side' ? 0.005 : 0.015);
+            const standingPose = filteredNoseY <= standingThreshold;
             const bowingPose = filteredNoseY >= bowThreshold;
             const kneelingPose = filteredNoseY >= kneelingThreshold;
-            const bottomPose =
-              filteredNoseY >= bottomThreshold &&
-              filteredNoseY > shoulderY + (perspectiveMode === 'side' ? 0.05 : 0.08);
+            const bottomPose = filteredNoseY >= bottomThreshold;
             const risingPose = filteredNoseY <= risingThreshold;
             const prostrationReadyPose = filteredNoseY <= prostrationReadyThreshold;
-            const prostrationBottomPose =
-              filteredNoseY >= prostrationBottomThreshold &&
-              filteredNoseY > shoulderY + (perspectiveMode === 'side' ? 0.08 : 0.12);
+            const prostrationBottomPose = filteredNoseY >= prostrationBottomThreshold;
 
             standingFramesRef.current = standingPose ? standingFramesRef.current + 1 : 0;
             descentFramesRef.current = bowingPose ? descentFramesRef.current + 1 : 0;
@@ -823,7 +831,9 @@ export default function KowtowCounter() {
             const shouldAutoCalibrate =
               now - lastCalibrationAtRef.current >= tuning.autoCalibrationIntervalMs &&
               stableFramesRef.current >= tuning.stableFrameCount &&
-              readyPose;
+              readyPose &&
+              motionPhaseRef.current === 'READY' &&
+              !cycleArmedRef.current;
             const phaseTimedOut =
               motionPhaseRef.current !== 'READY' &&
               now - phaseStartedAtRef.current >=
@@ -837,6 +847,30 @@ export default function KowtowCounter() {
               }
             };
 
+            if (showDebug && context) {
+              context.save();
+              context.font = `${Math.round(canvas.width * 0.032)}px monospace`;
+              context.fillStyle = 'rgba(0,0,0,0.6)';
+              context.fillRect(0, canvas.height - canvas.width * 0.28, canvas.width, canvas.width * 0.28);
+              context.fillStyle = '#34d399';
+              const lh = canvas.width * 0.038;
+              const bx = canvas.width * 0.02;
+              let by = canvas.height - canvas.width * 0.26;
+              const lines = [
+                `Phase: ${motionPhaseRef.current}`,
+                `NoseY: ${filteredNoseY.toFixed(3)}  ShoulderY: ${shoulderY.toFixed(3)}`,
+                `Min: ${minNoseYRef.current.toFixed(3)}  Max: ${maxNoseYRef.current.toFixed(3)}  Amp: ${amplitude.toFixed(3)}`,
+                `Standing: ${standingPose}  Bowing: ${bowingPose}  Bottom: ${bottomPose}`,
+                `Armed: ${cycleArmedRef.current}  Reliable: ${landmarkReliable}`,
+                `StandF: ${standingFramesRef.current}  BottomF: ${bottomFramesRef.current}  RiseF: ${risingFramesRef.current}`,
+              ];
+              for (const line of lines) {
+                context.fillText(line, bx, by);
+                by += lh;
+              }
+              context.restore();
+            }
+
             if (phaseTimedOut || shouldAutoCalibrate) {
               recalibrateMotionTracking(filteredNoseY);
               cycleArmedRef.current = readyPose;
@@ -845,7 +879,7 @@ export default function KowtowCounter() {
                 if (recoveryFramesRef.current >= 2) {
                   cycleArmedRef.current = true;
                 }
-                setIsBowed(false);
+                updateBowed(false);
               } else {
                 if (
                   motionPhaseRef.current !== 'READY' &&
@@ -856,28 +890,28 @@ export default function KowtowCounter() {
 
                 switch (motionPhaseRef.current) {
                   case 'READY':
-                    setIsBowed(false);
+                    updateBowed(false);
                     if (recoveryFramesRef.current >= 2) {
                       cycleArmedRef.current = true;
                     }
 
                     if (cycleArmedRef.current && prostrationBottomFramesRef.current >= 2) {
                       transitionPhase('PROSTRATION_BOTTOM');
-                      setIsBowed(true);
+                      updateBowed(true);
                     }
                     break;
                   case 'PROSTRATION_BOTTOM':
-                    setIsBowed(true);
+                    updateBowed(true);
                     if (recoveryFramesRef.current >= 2) {
                       transitionPhase('READY');
                       cycleArmedRef.current = false;
-                      setIsBowed(false);
+                      updateBowed(false);
                       setCount((current) => current + 1);
                     }
                     break;
                   default:
                     transitionPhase('READY');
-                    setIsBowed(false);
+                    updateBowed(false);
                     break;
                 }
               }
@@ -885,50 +919,50 @@ export default function KowtowCounter() {
               if (standingFramesRef.current >= 3) {
                 cycleArmedRef.current = true;
               }
-              setIsBowed(false);
+              updateBowed(false);
             } else {
               switch (motionPhaseRef.current) {
                 case 'READY':
-                  setIsBowed(false);
+                  updateBowed(false);
                   if (standingFramesRef.current >= 3) {
                     cycleArmedRef.current = true;
                   }
 
                   if (cycleArmedRef.current && descentFramesRef.current >= 2) {
                     transitionPhase('DESCENDING');
-                    setIsBowed(true);
+                    updateBowed(true);
                   }
                   break;
                 case 'DESCENDING':
-                  setIsBowed(true);
+                  updateBowed(true);
                   if (kneelingFramesRef.current >= 2) {
                     transitionPhase('KNEELING');
                   } else if (standingFramesRef.current >= 2) {
                     transitionPhase('READY');
-                    setIsBowed(false);
+                    updateBowed(false);
                   }
                   break;
                 case 'KNEELING':
-                  setIsBowed(true);
+                  updateBowed(true);
                   if (bottomFramesRef.current >= 2) {
                     transitionPhase('BOTTOM');
                   } else if (standingFramesRef.current >= 2) {
                     transitionPhase('READY');
-                    setIsBowed(false);
+                    updateBowed(false);
                   }
                   break;
                 case 'BOTTOM':
-                  setIsBowed(true);
+                  updateBowed(true);
                   if (risingFramesRef.current >= 2) {
                     transitionPhase('ASCENDING');
                   }
                   break;
                 case 'ASCENDING':
-                  setIsBowed(true);
-                  if (standingFramesRef.current >= 3) {
+                  updateBowed(true);
+                  if (standingFramesRef.current >= 2) {
                     transitionPhase('READY');
                     cycleArmedRef.current = false;
-                    setIsBowed(false);
+                    updateBowed(false);
                     setCount((current) => current + 1);
                   } else if (bottomFramesRef.current >= 2) {
                     transitionPhase('BOTTOM');
@@ -936,13 +970,13 @@ export default function KowtowCounter() {
                   break;
                 case 'PROSTRATION_BOTTOM':
                   transitionPhase('READY');
-                  setIsBowed(false);
+                  updateBowed(false);
                   break;
               }
             }
           }
         } else if (isCounting) {
-          setIsBowed(false);
+          updateBowed(false);
         }
       }
     }
@@ -1415,6 +1449,17 @@ export default function KowtowCounter() {
                 仅显示骨架
               </button>
             </div>
+            <button
+              type="button"
+              onClick={() => setShowDebug((prev) => !prev)}
+              className={`mt-3 w-full rounded-xl px-4 py-3 text-sm font-semibold transition-colors ${
+                showDebug
+                  ? 'bg-amber-500 text-stone-950'
+                  : 'border border-stone-700 bg-stone-900 text-stone-200'
+              }`}
+            >
+              {showDebug ? '关闭调试信息' : '显示调试信息'}
+            </button>
           </div>
 
           <div className="rounded-2xl border border-stone-700/50 bg-stone-800/60 p-4">
