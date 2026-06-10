@@ -133,6 +133,8 @@ export type DetectionStepResult = {
 };
 
 export const OCCLUSION_DROP_RATIO = 0.5;
+// 到底阶段属于合法的长时间停留（磕长头/祈祷），超时按普通阶段放宽 5 倍
+const BOTTOM_TIMEOUT_MULTIPLIER = 5;
 const AMPLITUDE_CAP = 0.6;
 const BASELINE_EMA_ALPHA = 0.1;
 const SCALE_SMOOTHING_ALPHA = 0.3;
@@ -233,6 +235,12 @@ function makeDebug(state: DetectionState, lost: boolean): DetectionDebug {
   };
 }
 
+function phaseTimeoutFor(phase: MotionPhase, params: DetectionParams): number {
+  return phase === 'BOTTOM' || phase === 'PROSTRATION_BOTTOM'
+    ? params.phaseTimeoutMs * BOTTOM_TIMEOUT_MULTIPLIER
+    : params.phaseTimeoutMs;
+}
+
 function passesDropGate(state: DetectionState, params: DetectionParams): boolean {
   if (state.standingBodyY === null || state.baselineBodyScale === null) {
     return true;
@@ -327,7 +335,7 @@ export function advanceDetection(
         }
       }
     }
-    if (next.phase !== 'READY' && now - next.phaseStartedAt >= params.phaseTimeoutMs) {
+    if (next.phase !== 'READY' && now - next.phaseStartedAt >= phaseTimeoutFor(next.phase, params)) {
       const reset = recalibrate(next, now, null);
       return {state: reset, counted: false, calibrated: false, debug: makeDebug(reset, true)};
     }
@@ -448,7 +456,7 @@ export function advanceDetection(
     next.phase === 'READY' &&
     !next.cycleArmed;
   const phaseTimedOut =
-    next.phase !== 'READY' && now - next.phaseStartedAt >= params.phaseTimeoutMs;
+    next.phase !== 'READY' && now - next.phaseStartedAt >= phaseTimeoutFor(next.phase, params);
   if (phaseTimedOut || shouldAutoCalibrate) {
     const reset = recalibrate(next, now, filteredBodyY);
     reset.cycleArmed = readyPose;

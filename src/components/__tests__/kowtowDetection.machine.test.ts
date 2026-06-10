@@ -159,13 +159,35 @@ describe('advanceDetection · 校准与超时', () => {
     expect(result.counted).toBe(0);
   });
 
-  it('阶段超时后复位但保留基线', () => {
+  it('中途阶段卡住超时后复位但保留基线', () => {
     const sim = createSim();
     feed(sim, signalAt(0.2), 10, ritualParams);
     const baseline = sim.state.standingBodyY;
-    feed(sim, signalAt(0.5), 320, ritualParams);
+    // 0.4 的下降量（0.2）不足绝对门槛（0.22），状态机停在中途阶段 → 按普通超时复位
+    feed(sim, signalAt(0.4), 320, ritualParams);
     expect(sim.state.phase).toBe('READY');
     expect(sim.state.standingBodyY).not.toBeNull();
     expect(baseline).not.toBeNull();
+  });
+
+  it('磕头在底部停留超过普通超时再起身，仍计 1 次', () => {
+    const sim = createSim();
+    feed(sim, signalAt(0.3), 10, prostrationParams);
+    // 250 帧 ≈ 8.25 秒 > 6 秒普通超时；底部阶段超时已放宽，不应复位
+    feed(sim, signalAt(0.6), 250, prostrationParams);
+    expect(sim.state.phase).toBe('PROSTRATION_BOTTOM');
+    const up = feed(sim, signalAt(0.3), 15, prostrationParams);
+    expect(up.counted).toBe(1);
+  });
+
+  it('大拜在底部丢失信号超过普通超时再起身，仍计 1 次', () => {
+    const sim = createSim();
+    feed(sim, signalAt(0.2), 10, ritualParams);
+    feed(sim, signalAt(0.85), 2, ritualParams);
+    // 底部整人丢失 380 帧 ≈ 12.5 秒 > 10 秒普通超时；底部阶段（含遮挡到底）不应复位
+    feed(sim, signalAt(null, null), 380, ritualParams);
+    expect(sim.state.phase).toBe('BOTTOM');
+    const up = feed(sim, signalAt(0.2), 20, ritualParams);
+    expect(up.counted).toBe(1);
   });
 });
