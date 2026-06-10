@@ -336,8 +336,8 @@ describe('advanceDetection · 消失即到底', () => {
   it('下行后整人丢失再回到站立，仍计 1 次', () => {
     const sim = createSim();
     feed(sim, signalAt(0.2), 10, ritualParams);
-    // 只喂 3 帧：状态机停在 KNEELING（4 帧会经绝对深度路径自行到 BOTTOM，测不到遮挡路径）
-    feed(sim, signalAt(0.85), 3, ritualParams);
+    // 只喂 2 帧：状态机停在 KNEELING（再多会经绝对深度路径自行到 BOTTOM，测不到遮挡路径）
+    feed(sim, signalAt(0.85), 2, ritualParams);
     const lostResult = feed(sim, signalAt(null, null), 14, ritualParams);
     expect(sim.state.phase).toBe('BOTTOM');
     expect(sim.state.occlusionBottom).toBe(true);
