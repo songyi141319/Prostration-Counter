@@ -16,16 +16,17 @@ import {
 } from 'lucide-react';
 import {useCallback, useEffect, useRef, useState, type ChangeEvent} from 'react';
 import {DrawingUtils, FilesetResolver, PoseLandmarker} from '@mediapipe/tasks-vision';
+import {
+  advanceDetection,
+  computeBodySignal,
+  createDetectionState,
+  startCalibration,
+  type CountMode,
+  type DetectionParams,
+  type DetectionState,
+  type PerspectiveMode,
+} from './kowtowDetection';
 
-type MotionPhase =
-  | 'READY'
-  | 'DESCENDING'
-  | 'KNEELING'
-  | 'BOTTOM'
-  | 'ASCENDING'
-  | 'PROSTRATION_BOTTOM';
-type CountMode = 'ritual' | 'prostration';
-type PerspectiveMode = 'front' | 'side';
 type PreviewMode = 'camera' | 'skeleton';
 type SoundStyle = 'soft' | 'short' | 'obvious' | 'long' | 'custom';
 type ToneNote = {
@@ -49,6 +50,13 @@ type TuningSettings = {
   recoveryBias: number;
   phaseTimeoutRitualMs: number;
   phaseTimeoutProstrationMs: number;
+  ritualDropKFront: number;
+  ritualDropKSide: number;
+  prostrationDropKFront: number;
+  prostrationDropKSide: number;
+  holdFrames: number;
+  lostBottomFrames: number;
+  recoveryTolerance: number;
 };
 type TuningField = {
   description: string;
@@ -91,6 +99,13 @@ const DEFAULT_TUNING_SETTINGS: TuningSettings = {
   recoveryBias: 1,
   phaseTimeoutRitualMs: 10000,
   phaseTimeoutProstrationMs: 6000,
+  ritualDropKFront: 1.1,
+  ritualDropKSide: 0.9,
+  prostrationDropKFront: 0.55,
+  prostrationDropKSide: 0.5,
+  holdFrames: 6,
+  lostBottomFrames: 4,
+  recoveryTolerance: 0.35,
 };
 const TUNING_SECTIONS: Array<{hint: string; title: string; fields: TuningField[]}> = [
   {
@@ -234,6 +249,81 @@ const TUNING_SECTIONS: Array<{hint: string; title: string; fields: TuningField[]
       },
     ],
   },
+  {
+    title: '绝对深度门槛',
+    hint: '以肩宽为尺子衡量“要下降多深才算一次有效动作”，鞠躬等浅动作达不到就不会计数。',
+    fields: [
+      {
+        key: 'ritualDropKFront',
+        label: '正拍大拜深度系数',
+        min: 0.5,
+        max: 2.5,
+        step: 0.05,
+        description: '完整礼拜模式下，头部下降深度与肩宽的最小比值。',
+        effect: '调小更容易计数；调大更严格、误计更少。',
+      },
+      {
+        key: 'ritualDropKSide',
+        label: '侧拍大拜深度系数',
+        min: 0.4,
+        max: 2.5,
+        step: 0.05,
+        description: '侧拍完整礼拜的深度比值要求。',
+        effect: '调小更灵敏；调大更严格。',
+      },
+      {
+        key: 'prostrationDropKFront',
+        label: '正拍磕头深度系数',
+        min: 0.2,
+        max: 1.5,
+        step: 0.05,
+        description: '磕头模式下，头部下降深度与肩宽的最小比值。',
+        effect: '调小更灵敏；调大点头不会被算进去。',
+      },
+      {
+        key: 'prostrationDropKSide',
+        label: '侧拍磕头深度系数',
+        min: 0.2,
+        max: 1.5,
+        step: 0.05,
+        description: '侧拍磕头的深度比值要求。',
+        effect: '调小更灵敏；调大更严格。',
+      },
+    ],
+  },
+  {
+    title: '遮挡与丢失',
+    hint: '近镜头趴到底时人会出画面，这里控制“消失多久算到底”以及信号短暂丢失的容忍度。',
+    fields: [
+      {
+        key: 'holdFrames',
+        label: '信号保持帧数',
+        min: 2,
+        max: 20,
+        step: 1,
+        description: '人体关键点短暂丢失时，沿用上一帧高度的最大帧数。',
+        effect: '调大抗闪烁更强；调大过头会延迟“消失判到底”。',
+      },
+      {
+        key: 'lostBottomFrames',
+        label: '消失判到底帧数',
+        min: 2,
+        max: 15,
+        step: 1,
+        description: '已确认下行后，整个人持续消失多少帧就直接判定“已到底”。',
+        effect: '调小漏计更少；调大更保守。',
+      },
+      {
+        key: 'recoveryTolerance',
+        label: '回正容差系数',
+        min: 0.15,
+        max: 0.8,
+        step: 0.05,
+        description: '判定“已回到站立/跪坐基线”时允许的高度误差（相对肩宽）。',
+        effect: '调大更容易判回正；调小必须起得更到位。',
+      },
+    ],
+  },
 ];
 
 function getViewportSize() {
@@ -256,22 +346,7 @@ export default function KowtowCounter() {
   const lastVideoTimeRef = useRef(-1);
   const previousCountRef = useRef(0);
   const lastOrientationRef = useRef(false);
-  const lastCalibrationAtRef = useRef(0);
-  const phaseStartedAtRef = useRef(0);
-  const stableFramesRef = useRef(0);
-  const lastFilteredNoseYRef = useRef<number | null>(null);
-  const motionPhaseRef = useRef<MotionPhase>('READY');
-  const cycleArmedRef = useRef(false);
-  const standingFramesRef = useRef(0);
-  const descentFramesRef = useRef(0);
-  const kneelingFramesRef = useRef(0);
-  const bottomFramesRef = useRef(0);
-  const prostrationBottomFramesRef = useRef(0);
-  const risingFramesRef = useRef(0);
-  const recoveryFramesRef = useRef(0);
-  const smoothedNoseYRef = useRef<number | null>(null);
-  const minNoseYRef = useRef(1.0);
-  const maxNoseYRef = useRef(0.0);
+  const detectionStateRef = useRef<DetectionState>(createDetectionState(0));
   const rotatedCanvasRef = useRef<OffscreenCanvas | null>(null);
   const isBowedRef = useRef(false);
 
@@ -298,6 +373,7 @@ export default function KowtowCounter() {
   const [playCountTickSound, setPlayCountTickSound] = useState(true);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [showDebug, setShowDebug] = useState(false);
+  const [isCalibrating, setIsCalibrating] = useState(false);
   const [tuning, setTuning] = useState<TuningSettings>(DEFAULT_TUNING_SETTINGS);
 
   const isLandscapeViewport = viewport.width > viewport.height;
@@ -482,28 +558,33 @@ export default function KowtowCounter() {
     }
   }, []);
 
-  const recalibrateMotionTracking = useCallback((baseNoseY?: number) => {
-    motionPhaseRef.current = 'READY';
-    cycleArmedRef.current = false;
-    standingFramesRef.current = 0;
-    descentFramesRef.current = 0;
-    kneelingFramesRef.current = 0;
-    bottomFramesRef.current = 0;
-    prostrationBottomFramesRef.current = 0;
-    risingFramesRef.current = 0;
-    recoveryFramesRef.current = 0;
-    stableFramesRef.current = 0;
-    lastFilteredNoseYRef.current = baseNoseY ?? null;
-    smoothedNoseYRef.current = baseNoseY ?? null;
-    minNoseYRef.current = typeof baseNoseY === 'number' ? baseNoseY : 1.0;
-    maxNoseYRef.current = typeof baseNoseY === 'number' ? baseNoseY : 0.0;
-    lastCalibrationAtRef.current = performance.now();
-    phaseStartedAtRef.current = lastCalibrationAtRef.current;
-    updateBowed(false);
-  }, []);
+  const recalibrateMotionTracking = useCallback(
+    (baseBodyY?: number, preserveBaselines = false) => {
+      const prevState = detectionStateRef.current;
+      const fresh = createDetectionState(performance.now(), baseBodyY ?? null);
+      detectionStateRef.current = preserveBaselines
+        ? {
+            ...fresh,
+            standingBodyY: prevState.standingBodyY,
+            baselineBodyScale: prevState.baselineBodyScale,
+            smoothedBodyScale: prevState.smoothedBodyScale,
+          }
+        : fresh;
+      setIsCalibrating(false);
+      updateBowed(false);
+    },
+    [updateBowed],
+  );
 
   const resetMotionTracking = useCallback(() => {
     recalibrateMotionTracking();
+    lastVideoTimeRef.current = -1;
+    clearOverlay();
+  }, [clearOverlay, recalibrateMotionTracking]);
+
+  // 暂停/继续计数用：镜头位置没变，保留已校准的站立基线与肩宽
+  const softResetMotionTracking = useCallback(() => {
+    recalibrateMotionTracking(undefined, true);
     lastVideoTimeRef.current = -1;
     clearOverlay();
   }, [clearOverlay, recalibrateMotionTracking]);
@@ -706,283 +787,91 @@ export default function KowtowCounter() {
               lineWidth: 2,
             });
           }
-
-          if (!isCounting) {
-            requestRef.current = requestAnimationFrame(renderLoop);
-            return;
-          }
-
-          const landmarks = results.landmarks[0];
-          const nose = landmarks[0];
-          const leftShoulder = landmarks[11];
-          const rightShoulder = landmarks[12];
-
-          const noseVis = nose?.visibility ?? 0;
-          const lShoulderVis = leftShoulder?.visibility ?? 0;
-          const rShoulderVis = rightShoulder?.visibility ?? 0;
-          const landmarkReliable = noseVis > 0.5 && (lShoulderVis > 0.5 || rShoulderVis > 0.5);
-
-          if (nose && leftShoulder && rightShoulder && landmarkReliable) {
-            const now = performance.now();
-            const leftShoulderVisibility = leftShoulder.visibility ?? 0;
-            const rightShoulderVisibility = rightShoulder.visibility ?? 0;
-            const dominantShoulder =
-              leftShoulderVisibility >= rightShoulderVisibility ? leftShoulder : rightShoulder;
-            const shoulderY =
-              perspectiveMode === 'side'
-                ? dominantShoulder.y
-                : (leftShoulder.y + rightShoulder.y) / 2;
-            const filteredNoseY =
-              smoothedNoseYRef.current === null
-                ? nose.y
-                : smoothedNoseYRef.current * 0.5 + nose.y * 0.5;
-
-            smoothedNoseYRef.current = filteredNoseY;
-            const noseDelta =
-              lastFilteredNoseYRef.current === null
-                ? 0
-                : Math.abs(filteredNoseY - lastFilteredNoseYRef.current);
-            lastFilteredNoseYRef.current = filteredNoseY;
-            stableFramesRef.current =
-              noseDelta <
-              (perspectiveMode === 'side' ? tuning.sideStableDelta : tuning.frontStableDelta)
-                ? stableFramesRef.current + 1
-                : 0;
-
-            minNoseYRef.current = Math.min(
-              1.0,
-              minNoseYRef.current + (perspectiveMode === 'side' ? 0.00022 : 0.00016),
-            );
-            maxNoseYRef.current = Math.max(
-              0.0,
-              maxNoseYRef.current - (perspectiveMode === 'side' ? 0.00022 : 0.00016),
-            );
-
-            if (filteredNoseY < minNoseYRef.current) {
-              minNoseYRef.current = filteredNoseY;
-            }
-            if (filteredNoseY > maxNoseYRef.current) {
-              maxNoseYRef.current = filteredNoseY;
-            }
-
-            const amplitude = maxNoseYRef.current - minNoseYRef.current;
-            const hasRitualRange =
-              amplitude >
-              (perspectiveMode === 'side'
-                ? tuning.ritualMinAmplitudeSide
-                : tuning.ritualMinAmplitudeFront);
-            const hasProstrationRange =
-              amplitude >
-              (perspectiveMode === 'side'
-                ? tuning.prostrationMinAmplitudeSide
-                : tuning.prostrationMinAmplitudeFront);
-            const standingThreshold =
-              minNoseYRef.current +
-              amplitude *
-                (perspectiveMode === 'side'
-                  ? 0.35 * tuning.recoveryBias
-                  : 0.3 * tuning.recoveryBias);
-            const bowThreshold =
-              minNoseYRef.current + amplitude * (perspectiveMode === 'side' ? 0.33 : 0.36);
-            const kneelingThreshold =
-              minNoseYRef.current + amplitude * (perspectiveMode === 'side' ? 0.52 : 0.58);
-            const bottomThreshold =
-              maxNoseYRef.current -
-              amplitude *
-                (perspectiveMode === 'side'
-                  ? 0.13 * tuning.ritualBottomDepthBias
-                  : 0.1 * tuning.ritualBottomDepthBias);
-            const risingThreshold =
-              maxNoseYRef.current -
-              amplitude *
-                (perspectiveMode === 'side'
-                  ? 0.28 * tuning.recoveryBias
-                  : 0.24 * tuning.recoveryBias);
-            const prostrationReadyThreshold =
-              minNoseYRef.current +
-              amplitude *
-                (perspectiveMode === 'side'
-                  ? 0.36 * tuning.recoveryBias
-                  : 0.42 * tuning.recoveryBias);
-            const prostrationBottomThreshold =
-              maxNoseYRef.current -
-              amplitude *
-                (perspectiveMode === 'side'
-                  ? 0.08 * tuning.prostrationBottomDepthBias
-                  : 0.06 * tuning.prostrationBottomDepthBias);
-            const standingPose = filteredNoseY <= standingThreshold;
-            const bowingPose = filteredNoseY >= bowThreshold;
-            const kneelingPose = filteredNoseY >= kneelingThreshold;
-            const bottomPose = filteredNoseY >= bottomThreshold;
-            const risingPose = filteredNoseY <= risingThreshold;
-            const prostrationReadyPose = filteredNoseY <= prostrationReadyThreshold;
-            const prostrationBottomPose = filteredNoseY >= prostrationBottomThreshold;
-
-            standingFramesRef.current = standingPose ? standingFramesRef.current + 1 : 0;
-            descentFramesRef.current = bowingPose ? descentFramesRef.current + 1 : 0;
-            kneelingFramesRef.current = kneelingPose ? kneelingFramesRef.current + 1 : 0;
-            bottomFramesRef.current = bottomPose ? bottomFramesRef.current + 1 : 0;
-            prostrationBottomFramesRef.current = prostrationBottomPose
-              ? prostrationBottomFramesRef.current + 1
-              : 0;
-            risingFramesRef.current = risingPose ? risingFramesRef.current + 1 : 0;
-            recoveryFramesRef.current = prostrationReadyPose ? recoveryFramesRef.current + 1 : 0;
-            const readyPose = countMode === 'ritual' ? standingPose : prostrationReadyPose;
-            const shouldAutoCalibrate =
-              now - lastCalibrationAtRef.current >= tuning.autoCalibrationIntervalMs &&
-              stableFramesRef.current >= tuning.stableFrameCount &&
-              readyPose &&
-              motionPhaseRef.current === 'READY' &&
-              !cycleArmedRef.current;
-            const phaseTimedOut =
-              motionPhaseRef.current !== 'READY' &&
-              now - phaseStartedAtRef.current >=
-                (countMode === 'ritual'
-                  ? tuning.phaseTimeoutRitualMs
-                  : tuning.phaseTimeoutProstrationMs);
-            const transitionPhase = (nextPhase: MotionPhase) => {
-              if (motionPhaseRef.current !== nextPhase) {
-                motionPhaseRef.current = nextPhase;
-                phaseStartedAtRef.current = now;
-              }
-            };
-
-            if (showDebug && context) {
-              context.save();
-              context.font = `${Math.round(canvas.width * 0.032)}px monospace`;
-              context.fillStyle = 'rgba(0,0,0,0.6)';
-              context.fillRect(0, canvas.height - canvas.width * 0.28, canvas.width, canvas.width * 0.28);
-              context.fillStyle = '#34d399';
-              const lh = canvas.width * 0.038;
-              const bx = canvas.width * 0.02;
-              let by = canvas.height - canvas.width * 0.26;
-              const lines = [
-                `Phase: ${motionPhaseRef.current}`,
-                `NoseY: ${filteredNoseY.toFixed(3)}  ShoulderY: ${shoulderY.toFixed(3)}`,
-                `Min: ${minNoseYRef.current.toFixed(3)}  Max: ${maxNoseYRef.current.toFixed(3)}  Amp: ${amplitude.toFixed(3)}`,
-                `Standing: ${standingPose}  Bowing: ${bowingPose}  Bottom: ${bottomPose}`,
-                `Armed: ${cycleArmedRef.current}  Reliable: ${landmarkReliable}`,
-                `StandF: ${standingFramesRef.current}  BottomF: ${bottomFramesRef.current}  RiseF: ${risingFramesRef.current}`,
-              ];
-              for (const line of lines) {
-                context.fillText(line, bx, by);
-                by += lh;
-              }
-              context.restore();
-            }
-
-            if (phaseTimedOut || shouldAutoCalibrate) {
-              recalibrateMotionTracking(filteredNoseY);
-              cycleArmedRef.current = readyPose;
-            } else if (countMode === 'prostration') {
-              if (!hasProstrationRange) {
-                if (recoveryFramesRef.current >= 2) {
-                  cycleArmedRef.current = true;
-                }
-                updateBowed(false);
-              } else {
-                if (
-                  motionPhaseRef.current !== 'READY' &&
-                  motionPhaseRef.current !== 'PROSTRATION_BOTTOM'
-                ) {
-                  transitionPhase('READY');
-                }
-
-                switch (motionPhaseRef.current) {
-                  case 'READY':
-                    updateBowed(false);
-                    if (recoveryFramesRef.current >= 2) {
-                      cycleArmedRef.current = true;
-                    }
-
-                    if (cycleArmedRef.current && prostrationBottomFramesRef.current >= 2) {
-                      transitionPhase('PROSTRATION_BOTTOM');
-                      updateBowed(true);
-                    }
-                    break;
-                  case 'PROSTRATION_BOTTOM':
-                    updateBowed(true);
-                    if (recoveryFramesRef.current >= 2) {
-                      transitionPhase('READY');
-                      cycleArmedRef.current = false;
-                      updateBowed(false);
-                      setCount((current) => current + 1);
-                    }
-                    break;
-                  default:
-                    transitionPhase('READY');
-                    updateBowed(false);
-                    break;
-                }
-              }
-            } else if (!hasRitualRange) {
-              if (standingFramesRef.current >= 3) {
-                cycleArmedRef.current = true;
-              }
-              updateBowed(false);
-            } else {
-              switch (motionPhaseRef.current) {
-                case 'READY':
-                  updateBowed(false);
-                  if (standingFramesRef.current >= 3) {
-                    cycleArmedRef.current = true;
-                  }
-
-                  if (cycleArmedRef.current && descentFramesRef.current >= 2) {
-                    transitionPhase('DESCENDING');
-                    updateBowed(true);
-                  }
-                  break;
-                case 'DESCENDING':
-                  updateBowed(true);
-                  if (kneelingFramesRef.current >= 2) {
-                    transitionPhase('KNEELING');
-                  } else if (standingFramesRef.current >= 2) {
-                    transitionPhase('READY');
-                    updateBowed(false);
-                  }
-                  break;
-                case 'KNEELING':
-                  updateBowed(true);
-                  if (bottomFramesRef.current >= 2) {
-                    transitionPhase('BOTTOM');
-                  } else if (standingFramesRef.current >= 2) {
-                    transitionPhase('READY');
-                    updateBowed(false);
-                  }
-                  break;
-                case 'BOTTOM':
-                  updateBowed(true);
-                  if (risingFramesRef.current >= 2) {
-                    transitionPhase('ASCENDING');
-                  }
-                  break;
-                case 'ASCENDING':
-                  updateBowed(true);
-                  if (standingFramesRef.current >= 2) {
-                    transitionPhase('READY');
-                    cycleArmedRef.current = false;
-                    updateBowed(false);
-                    setCount((current) => current + 1);
-                  } else if (bottomFramesRef.current >= 2) {
-                    transitionPhase('BOTTOM');
-                  }
-                  break;
-                case 'PROSTRATION_BOTTOM':
-                  transitionPhase('READY');
-                  updateBowed(false);
-                  break;
-              }
-            }
-          }
-        } else if (isCounting) {
-          updateBowed(false);
         }
+
+        if (isCounting || detectionStateRef.current.calibration) {
+          const now = performance.now();
+          const signal = computeBodySignal(results.landmarks?.[0] ?? null);
+          const detectionParams: DetectionParams = {
+            mode: countMode,
+            perspective: perspectiveMode,
+            autoCalibrationIntervalMs: tuning.autoCalibrationIntervalMs,
+            stableFrameCount: tuning.stableFrameCount,
+            stableDelta:
+              perspectiveMode === 'side' ? tuning.sideStableDelta : tuning.frontStableDelta,
+            minAmplitude:
+              countMode === 'ritual'
+                ? perspectiveMode === 'side'
+                  ? tuning.ritualMinAmplitudeSide
+                  : tuning.ritualMinAmplitudeFront
+                : perspectiveMode === 'side'
+                  ? tuning.prostrationMinAmplitudeSide
+                  : tuning.prostrationMinAmplitudeFront,
+            bottomDepthBias:
+              countMode === 'ritual'
+                ? tuning.ritualBottomDepthBias
+                : tuning.prostrationBottomDepthBias,
+            recoveryBias: tuning.recoveryBias,
+            phaseTimeoutMs:
+              countMode === 'ritual'
+                ? tuning.phaseTimeoutRitualMs
+                : tuning.phaseTimeoutProstrationMs,
+            dropGateK:
+              countMode === 'ritual'
+                ? perspectiveMode === 'side'
+                  ? tuning.ritualDropKSide
+                  : tuning.ritualDropKFront
+                : perspectiveMode === 'side'
+                  ? tuning.prostrationDropKSide
+                  : tuning.prostrationDropKFront,
+            holdFrames: tuning.holdFrames,
+            lostBottomFrames: tuning.lostBottomFrames,
+            recoveryTolerance: tuning.recoveryTolerance,
+          };
+
+          const result = advanceDetection(detectionStateRef.current, signal, now, detectionParams);
+          detectionStateRef.current = result.state;
+
+          if (result.counted) {
+            setCount((current) => current + 1);
+          }
+          if (result.calibrated) {
+            setIsCalibrating(false);
+            void playCountTickTone();
+          }
+          updateBowed(result.state.isBowed);
+
+          if (showDebug && context) {
+            const d = result.debug;
+            const fmt = (value: number | null) => (value === null ? '--' : value.toFixed(3));
+            context.save();
+            context.font = `${Math.round(canvas.width * 0.032)}px monospace`;
+            context.fillStyle = 'rgba(0,0,0,0.6)';
+            context.fillRect(0, canvas.height - canvas.width * 0.28, canvas.width, canvas.width * 0.28);
+            context.fillStyle = '#34d399';
+            const lh = canvas.width * 0.038;
+            const bx = canvas.width * 0.02;
+            let by = canvas.height - canvas.width * 0.26;
+            const lines = [
+              `Phase: ${d.phase}  Armed: ${d.armed}`,
+              `BodyY: ${fmt(d.bodyY)}  Scale: ${fmt(d.bodyScale)}`,
+              `Base: ${fmt(d.standingBodyY)}  BaseScale: ${fmt(d.baselineBodyScale)}  Drop: ${fmt(d.drop)}`,
+              `Min: ${fmt(d.minY)}  Max: ${fmt(d.maxY)}  Amp: ${fmt(d.amplitude)}`,
+              `Lost: ${d.lost}  OcclusionBottom: ${d.occlusionBottom}`,
+            ];
+            for (const line of lines) {
+              context.fillText(line, bx, by);
+              by += lh;
+            }
+            context.restore();
+          }
+        }
+
       }
     }
 
     requestRef.current = requestAnimationFrame(renderLoop);
-  }, [countMode, isCounting, isRunning, perspectiveMode, previewMode, recalibrateMotionTracking, tuning]);
+  }, [countMode, isCounting, isRunning, perspectiveMode, playCountTickTone, previewMode, showDebug, tuning, updateBowed]);
 
   useEffect(() => {
     if (isRunning) {
@@ -1097,13 +986,24 @@ export default function KowtowCounter() {
 
     if (isCounting) {
       setIsCounting(false);
-      resetMotionTracking();
+      softResetMotionTracking();
       return;
     }
 
     void ensureAudioContext();
-    resetMotionTracking();
+    softResetMotionTracking();
     setIsCounting(true);
+  };
+
+  const handleStartCalibration = () => {
+    if (!isRunning) {
+      return;
+    }
+
+    void ensureAudioContext();
+    detectionStateRef.current = startCalibration(detectionStateRef.current, performance.now());
+    setIsCalibrating(true);
+    setIsSettingsOpen(false);
   };
 
   const applyCustomTarget = () => {
@@ -1264,6 +1164,11 @@ export default function KowtowCounter() {
                   {targetCount > 0 && (
                     <div className="rounded-full border border-stone-700/70 bg-stone-950/75 px-3 py-1 text-xs font-semibold text-stone-200">
                       目标提醒 {targetCount} 拜
+                    </div>
+                  )}
+                  {isCalibrating && (
+                    <div className="rounded-full border border-amber-400/50 bg-amber-400/20 px-3 py-1 text-xs font-semibold text-amber-200">
+                      校准中，请站好不动…
                     </div>
                   )}
                 </div>
@@ -1720,6 +1625,14 @@ export default function KowtowCounter() {
                     className="rounded-xl border border-sky-400/30 bg-sky-400/10 px-4 py-3 text-sm font-semibold text-sky-100 transition-colors active:scale-95"
                   >
                     立即重新校准
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleStartCalibration}
+                    disabled={!isRunning}
+                    className="rounded-xl border border-amber-400/30 bg-amber-400/10 px-4 py-3 text-sm font-semibold text-amber-100 transition-colors active:scale-95 disabled:opacity-40"
+                  >
+                    校准站立基线（站好 2 秒）
                   </button>
                 </div>
 
