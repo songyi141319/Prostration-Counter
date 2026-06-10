@@ -3,6 +3,7 @@ import {
   BellRing,
   Camera,
   CameraOff,
+  Crosshair,
   Eye,
   EyeOff,
   Info,
@@ -348,6 +349,7 @@ export default function KowtowCounter() {
   const lastOrientationRef = useRef(false);
   const detectionStateRef = useRef<DetectionState>(createDetectionState(0));
   const rotatedCanvasRef = useRef<OffscreenCanvas | null>(null);
+  const wakeLockRef = useRef<WakeLockSentinel | null>(null);
   const isBowedRef = useRef(false);
 
   const [viewport, setViewport] = useState(getViewportSize);
@@ -371,6 +373,7 @@ export default function KowtowCounter() {
   const [customToneRepeats, setCustomToneRepeats] = useState('2');
   const [customToneGap, setCustomToneGap] = useState('160');
   const [playCountTickSound, setPlayCountTickSound] = useState(true);
+  const [tickVolume, setTickVolume] = useState(3);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [showDebug, setShowDebug] = useState(false);
   const [isCalibrating, setIsCalibrating] = useState(false);
@@ -501,8 +504,9 @@ export default function KowtowCounter() {
 
     const startAt = audioContext.currentTime;
     const masterGain = audioContext.createGain();
+    const peakGain = Math.min(0.55 * tickVolume, 3.5);
     masterGain.gain.setValueAtTime(0.0001, startAt);
-    masterGain.gain.exponentialRampToValueAtTime(0.55, startAt + 0.008);
+    masterGain.gain.exponentialRampToValueAtTime(peakGain, startAt + 0.008);
     masterGain.gain.exponentialRampToValueAtTime(0.0001, startAt + 0.18);
     masterGain.connect(audioContext.destination);
 
@@ -541,7 +545,7 @@ export default function KowtowCounter() {
     highGain.connect(masterGain);
     highOscillator.start(startAt);
     highOscillator.stop(startAt + 0.11);
-  }, [ensureAudioContext]);
+  }, [ensureAudioContext, tickVolume]);
 
   const clearOverlay = useCallback(() => {
     const canvas = canvasRef.current;
@@ -588,6 +592,46 @@ export default function KowtowCounter() {
     lastVideoTimeRef.current = -1;
     clearOverlay();
   }, [clearOverlay, recalibrateMotionTracking]);
+
+  // 计数期间保持屏幕常亮；切回前台时重新申请（系统会在息屏/切后台时自动释放）
+  useEffect(() => {
+    if (!isCounting || !('wakeLock' in navigator)) {
+      return;
+    }
+
+    let cancelled = false;
+
+    const acquireWakeLock = async () => {
+      try {
+        const sentinel = await navigator.wakeLock.request('screen');
+        if (cancelled) {
+          await sentinel.release();
+          return;
+        }
+        wakeLockRef.current = sentinel;
+      } catch {
+        // 低电量模式等场景下系统可能拒绝，常亮失败不影响计数
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        void acquireWakeLock();
+      }
+    };
+
+    void acquireWakeLock();
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      cancelled = true;
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      if (wakeLockRef.current) {
+        void wakeLockRef.current.release();
+        wakeLockRef.current = null;
+      }
+    };
+  }, [isCounting]);
 
   const stopMediaTracks = useCallback(() => {
     const video = videoRef.current;
@@ -1239,9 +1283,19 @@ export default function KowtowCounter() {
                 <RefreshCw className="h-6 w-6" />
                 计数清零
               </button>
+
+              <button
+                type="button"
+                onClick={handleStartCalibration}
+                disabled={!isRunning}
+                className="flex flex-1 items-center justify-center gap-2 rounded-2xl border border-amber-400/30 bg-amber-400/10 px-6 py-4 text-lg font-bold text-amber-200 transition-all active:scale-95 disabled:border-stone-700 disabled:bg-stone-900 disabled:text-stone-500"
+              >
+                <Crosshair className="h-6 w-6" />
+                手动校准
+              </button>
             </div>
             <p className="mt-3 text-xs leading-relaxed text-stone-400">
-              先开启摄像头，再点击“开始计数”。计数逻辑已恢复为原版动态幅度判断：完整站立到到底再回站立，才记 1 次。
+              先开启摄像头，再点击“开始计数”。识别不准时点“手动校准”，在镜头前站好（磕头模式保持跪坐）约 3 秒，听到木鱼音即校准完成。
             </p>
           </div>
 
@@ -1609,6 +1663,25 @@ export default function KowtowCounter() {
                       试听木鱼音
                     </button>
                   </div>
+
+                  <label className="mt-4 block text-sm text-stone-200">
+                    <span className="flex items-center justify-between">
+                      <span className="font-semibold text-stone-100">木鱼音量</span>
+                      <span className="text-xs text-stone-400">{tickVolume.toFixed(1)} 倍</span>
+                    </span>
+                    <input
+                      type="range"
+                      min={0.5}
+                      max={6}
+                      step={0.5}
+                      value={tickVolume}
+                      onChange={(event) => setTickVolume(Number.parseFloat(event.target.value))}
+                      className="mt-2 w-full accent-emerald-500"
+                    />
+                    <span className="mt-1 block text-xs leading-relaxed text-stone-400">
+                      默认 3 倍。调整后点“试听木鱼音”确认大小。
+                    </span>
+                  </label>
                 </div>
 
                 <div className="flex flex-col gap-3 md:flex-row">
