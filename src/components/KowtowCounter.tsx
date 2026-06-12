@@ -27,6 +27,14 @@ import {
   type DetectionState,
   type PerspectiveMode,
 } from './kowtowDetection';
+import {
+  advancePoseSequence,
+  createPoseEngineState,
+  DEFAULT_POSE_ENGINE_PARAMS,
+  type PoseEngineParams,
+  type PoseEngineState,
+  type SequencePhase,
+} from './poseEngine';
 
 type PreviewMode = 'camera' | 'skeleton';
 type SoundStyle = 'soft' | 'short' | 'obvious' | 'long' | 'custom';
@@ -79,6 +87,32 @@ const PERSPECTIVE_MODE_OPTIONS: Array<{hint: string; label: string; value: Persp
   {value: 'front', label: '正拍模式', hint: '手机放在正前方'},
   {value: 'side', label: '侧拍模式', hint: '手机放在身体侧边'},
 ];
+
+type EngineKind = 'smart' | 'classic';
+
+const ENGINE_OPTIONS: Array<{hint: string; label: string; value: EngineKind}> = [
+  {value: 'smart', label: '智能引擎', hint: '姿态序列验证,误计接近零(推荐)'},
+  {value: 'classic', label: '经典引擎', hint: '深度门槛算法,兼容旧行为'},
+];
+
+const RITUAL_POSE_PARAMS: PoseEngineParams = {mode: 'ritual', ...DEFAULT_POSE_ENGINE_PARAMS};
+const PROSTRATION_POSE_PARAMS: PoseEngineParams = {
+  mode: 'prostration',
+  ...DEFAULT_POSE_ENGINE_PARAMS,
+  minCycleMs: 1200,
+};
+
+const ENGINE_PHASE_TEXT: Record<SequencePhase, string> = {
+  AWAIT_SETUP: '请站到画面中保持站立',
+  ARMED: '已就绪 · 站立',
+  BOW: '弯腰',
+  KNEEL: '跪下',
+  BOTTOM: '磕头',
+  RISE: '起身',
+  SUSPENDED: '画面中断 · 起身站立可补计',
+};
+
+const ENGINE_BOWED_PHASES = new Set<SequencePhase>(['BOW', 'KNEEL', 'BOTTOM', 'RISE']);
 const SOUND_STYLE_OPTIONS: Array<{hint: string; label: string; value: SoundStyle}> = [
   {value: 'soft', label: '轻柔', hint: '柔和单声'},
   {value: 'short', label: '短促', hint: '短而清楚'},
@@ -348,6 +382,7 @@ export default function KowtowCounter() {
   const previousCountRef = useRef(0);
   const lastOrientationRef = useRef(false);
   const detectionStateRef = useRef<DetectionState>(createDetectionState(0));
+  const poseStateRef = useRef<PoseEngineState>(createPoseEngineState(0));
   const rotatedCanvasRef = useRef<OffscreenCanvas | null>(null);
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
   const isBowedRef = useRef(false);
@@ -378,6 +413,9 @@ export default function KowtowCounter() {
   const [showDebug, setShowDebug] = useState(false);
   const [isCalibrating, setIsCalibrating] = useState(false);
   const [tuning, setTuning] = useState<TuningSettings>(DEFAULT_TUNING_SETTINGS);
+  const [engine, setEngine] = useState<EngineKind>('smart');
+  const [enginePhase, setEnginePhase] = useState<SequencePhase>('AWAIT_SETUP');
+  const [backfillNotice, setBackfillNotice] = useState(false);
 
   const isLandscapeViewport = viewport.width > viewport.height;
   const isCompactLandscape = isLandscapeViewport && viewport.height > 0 && viewport.height < 620;
@@ -833,7 +871,54 @@ export default function KowtowCounter() {
           }
         }
 
-        if (isCounting || detectionStateRef.current.calibration) {
+        if (engine === 'smart' && isCounting) {
+          const now = performance.now();
+          const poseParams = countMode === 'ritual' ? RITUAL_POSE_PARAMS : PROSTRATION_POSE_PARAMS;
+          const prevPhase = poseStateRef.current.phase;
+          const result = advancePoseSequence(
+            poseStateRef.current,
+            results.landmarks?.[0] ?? null,
+            now,
+            poseParams,
+          );
+          poseStateRef.current = result.state;
+
+          if (result.counted || result.backfilled) {
+            setCount((current) => current + 1);
+          }
+          if (result.backfilled) {
+            setBackfillNotice(true);
+            window.setTimeout(() => setBackfillNotice(false), 3000);
+          }
+          if (result.state.phase !== prevPhase) {
+            setEnginePhase(result.state.phase);
+          }
+          updateBowed(ENGINE_BOWED_PHASES.has(result.state.phase));
+
+          if (showDebug && context) {
+            const d = result.debug;
+            const fmt = (value: number | null) => (value === null ? '--' : value.toFixed(3));
+            context.save();
+            context.font = `${Math.round(canvas.width * 0.032)}px monospace`;
+            context.fillStyle = 'rgba(0,0,0,0.6)';
+            context.fillRect(0, canvas.height - canvas.width * 0.22, canvas.width, canvas.width * 0.22);
+            context.fillStyle = '#34d399';
+            const lh = canvas.width * 0.038;
+            const bx = canvas.width * 0.02;
+            let by = canvas.height - canvas.width * 0.2;
+            const lines = [
+              `Phase: ${d.phase}  Label: ${d.label}  FoV: ${d.fieldOfView ?? '--'}`,
+              `HeadY: ${fmt(d.headY)}  ShoulderY: ${fmt(d.shoulderY)}`,
+              `Gap: ${fmt(d.gap)}  Sink: ${fmt(d.sink)}  Base: ${fmt(d.baselineShoulderY)}`,
+              `LastFinish: ${d.lastFinishReason ?? '--'}`,
+            ];
+            for (const line of lines) {
+              context.fillText(line, bx, by);
+              by += lh;
+            }
+            context.restore();
+          }
+        } else if (isCounting || detectionStateRef.current.calibration) {
           const now = performance.now();
           const signal = computeBodySignal(results.landmarks?.[0] ?? null);
           const detectionParams: DetectionParams = {
@@ -915,7 +1000,7 @@ export default function KowtowCounter() {
     }
 
     requestRef.current = requestAnimationFrame(renderLoop);
-  }, [countMode, isCounting, isRunning, perspectiveMode, playCountTickTone, previewMode, showDebug, tuning, updateBowed]);
+  }, [countMode, engine, isCounting, isRunning, perspectiveMode, playCountTickTone, previewMode, showDebug, tuning, updateBowed]);
 
   useEffect(() => {
     if (isRunning) {
@@ -1036,7 +1121,19 @@ export default function KowtowCounter() {
 
     void ensureAudioContext();
     softResetMotionTracking();
+    poseStateRef.current = createPoseEngineState(performance.now());
+    setEnginePhase('AWAIT_SETUP');
     setIsCounting(true);
+  };
+
+  const handleEngineChange = (nextEngine: EngineKind) => {
+    if (engine === nextEngine) {
+      return;
+    }
+    setEngine(nextEngine);
+    poseStateRef.current = createPoseEngineState(performance.now());
+    setEnginePhase('AWAIT_SETUP');
+    resetMotionTracking();
   };
 
   const handleStartCalibration = () => {
@@ -1231,6 +1328,18 @@ export default function KowtowCounter() {
                     ref={canvasRef}
                     className="absolute inset-0 z-10 h-full w-full object-contain"
                   />
+                  {engine === 'smart' && isCounting ? (
+                    <div className="absolute left-3 top-3 z-20 rounded-full bg-stone-950/80 px-3 py-1.5 text-xs font-semibold text-emerald-300">
+                      {enginePhase === 'AWAIT_SETUP' && countMode === 'prostration'
+                        ? '请在画面中保持跪坐'
+                        : ENGINE_PHASE_TEXT[enginePhase]}
+                    </div>
+                  ) : null}
+                  {backfillNotice ? (
+                    <div className="absolute right-3 top-3 z-20 rounded-full bg-amber-500/90 px-3 py-1.5 text-xs font-bold text-stone-950">
+                      +1(补)
+                    </div>
+                  ) : null}
                 </div>
               </div>
             </div>
@@ -1284,19 +1393,47 @@ export default function KowtowCounter() {
                 计数清零
               </button>
 
-              <button
-                type="button"
-                onClick={handleStartCalibration}
-                disabled={!isRunning}
-                className="flex flex-1 items-center justify-center gap-2 rounded-2xl border border-amber-400/30 bg-amber-400/10 px-6 py-4 text-lg font-bold text-amber-200 transition-all active:scale-95 disabled:border-stone-700 disabled:bg-stone-900 disabled:text-stone-500"
-              >
-                <Crosshair className="h-6 w-6" />
-                手动校准
-              </button>
+              {engine === 'classic' ? (
+                <button
+                  type="button"
+                  onClick={handleStartCalibration}
+                  disabled={!isRunning}
+                  className="flex flex-1 items-center justify-center gap-2 rounded-2xl border border-amber-400/30 bg-amber-400/10 px-6 py-4 text-lg font-bold text-amber-200 transition-all active:scale-95 disabled:border-stone-700 disabled:bg-stone-900 disabled:text-stone-500"
+                >
+                  <Crosshair className="h-6 w-6" />
+                  手动校准
+                </button>
+              ) : null}
             </div>
             <p className="mt-3 text-xs leading-relaxed text-stone-400">
-              先开启摄像头，再点击“开始计数”。识别不准时点“手动校准”，在镜头前站好（磕头模式保持跪坐）约 3 秒，听到木鱼音即校准完成。
+              {engine === 'smart'
+                ? '先开启摄像头，再点击“开始计数”，然后站到画面中保持站立约 2 秒（磕头模式保持跪坐），看到“已就绪”后开始礼拜。摆放手机期间不会误计。'
+                : '先开启摄像头，再点击“开始计数”。识别不准时点“手动校准”，在镜头前站好（磕头模式保持跪坐）约 3 秒，听到木鱼音即校准完成。'}
             </p>
+          </div>
+
+          <div className="rounded-2xl border border-stone-700/50 bg-stone-800/60 p-4">
+            <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-stone-200">
+              <Activity className="h-4 w-4 text-emerald-300" />
+              计数引擎
+            </div>
+            <div className="grid gap-3 md:grid-cols-2">
+              {ENGINE_OPTIONS.map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  onClick={() => handleEngineChange(option.value)}
+                  className={`rounded-xl border px-4 py-3 text-left transition-all ${
+                    engine === option.value
+                      ? 'border-emerald-400/60 bg-emerald-500/10 text-emerald-200'
+                      : 'border-stone-700 bg-stone-900 text-stone-300'
+                  }`}
+                >
+                  <div className="text-sm font-bold">{option.label}</div>
+                  <div className="mt-1 text-xs text-stone-400">{option.hint}</div>
+                </button>
+              ))}
+            </div>
           </div>
 
           <div className="rounded-2xl border border-stone-700/50 bg-stone-800/60 p-4">
