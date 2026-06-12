@@ -381,7 +381,12 @@ function handleBottom(
   now: number,
   params: PoseEngineParams,
 ): FinishReason | null {
-  if (next.label === 'kneeling' || next.label === 'standing' || next.label === 'bowing') {
+  // ritual:起身途中会经过 bowing 形态;磕头数模式 bowing 就是趴底本身,只认回跪坐
+  const risen =
+    params.mode === 'prostration'
+      ? next.label === 'kneeling' || next.label === 'standing'
+      : next.label === 'kneeling' || next.label === 'standing' || next.label === 'bowing';
+  if (risen) {
     next.phase = 'RISE';
     next.phaseStartedAt = now;
     return null;
@@ -402,7 +407,9 @@ function handleRise(
     const longEnough = next.cycleStartAt !== null && now - next.cycleStartAt >= params.minCycleMs;
     return longEnough ? 'completed' : 'rejected';
   }
-  if (next.label === 'prostrate') {
+  const backToBottom =
+    next.label === 'prostrate' || (params.mode === 'prostration' && next.label === 'bowing');
+  if (backToBottom) {
     next.phase = 'BOTTOM';
     next.phaseStartedAt = now;
     return null;

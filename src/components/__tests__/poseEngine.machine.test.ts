@@ -344,3 +344,41 @@ describe('advancePoseSequence · 上半身视野与长趴底', () => {
     expect(sim.backfilled).toBe(0);
   });
 });
+
+// 磕头数模式的一次叩首:跪坐 → 俯身触地 → 回跪坐
+function prostrationCycle(sim: Sim) {
+  rampPose(sim, SIT, SIT_BOTTOM, 10, prostrationParams);
+  feed(sim, SIT_BOTTOM, 25, prostrationParams);
+  rampPose(sim, SIT_BOTTOM, SIT, 10, prostrationParams);
+  feed(sim, SIT, 30, prostrationParams);
+}
+
+describe('advancePoseSequence · 磕头数模式', () => {
+  it('跪坐基线建立后,一次俯身叩首计 1', () => {
+    const sim = createSim();
+    setup(sim, SIT, prostrationParams);
+    expect(sim.state.phase).toBe('ARMED');
+    prostrationCycle(sim);
+    expect(sim.counted).toBe(1);
+  });
+
+  it('连续三叩计 3', () => {
+    const sim = createSim();
+    setup(sim, SIT, prostrationParams);
+    for (let i = 0; i < 3; i += 1) {
+      prostrationCycle(sim);
+    }
+    expect(sim.counted).toBe(3);
+  });
+
+  it('叩首中失焦 → 重新坐稳 → 补计 1,总增量恰 1', () => {
+    const sim = createSim();
+    setup(sim, SIT, prostrationParams);
+    rampPose(sim, SIT, SIT_BOTTOM, 10, prostrationParams);
+    feed(sim, SIT_BOTTOM, 15, prostrationParams);
+    feed(sim, null, 2750, prostrationParams); // 失焦约 91s > bottomTimeout → SUSPENDED
+    expect(sim.state.phase).toBe('SUSPENDED');
+    feed(sim, SIT, 60, prostrationParams);
+    expect(sim.counted + sim.backfilled).toBe(1);
+  });
+});
