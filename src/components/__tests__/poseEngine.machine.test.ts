@@ -243,3 +243,71 @@ describe('advancePoseSequence · 拒计(宁漏勿误)', () => {
     expect(sim.state.lastFinishReason).toBe('rejected');
   });
 });
+
+describe('advancePoseSequence · 挂起与补计', () => {
+  it('全身视野:跪后失焦 → 挂起 → 回站 1.5s → 补计 1(用户核心诉求)', () => {
+    const sim = createSim();
+    setup(sim, STAND_FULL, ritualParams);
+    rampPose(sim, STAND_FULL, BOW_FULL, 12, ritualParams);
+    feed(sim, BOW_FULL, 12, ritualParams);
+    rampPose(sim, BOW_FULL, KNEEL_FULL, 10, ritualParams);
+    feed(sim, KNEEL_FULL, 12, ritualParams);
+    feed(sim, null, 90, ritualParams); // 失焦约 3s > absentToSuspendMs
+    expect(sim.state.phase).toBe('SUSPENDED');
+    feed(sim, STAND_FULL, 60, ritualParams); // 重新站定约 2s > backfillStandMs
+    expect(sim.backfilled).toBe(1);
+    expect(sim.counted).toBe(0);
+    expect(sim.counted + sim.backfilled).toBe(1); // 防双计:总增量恰 1
+    expect(sim.state.phase).toBe('ARMED');
+  });
+
+  it('弯腰后消失、无任何下跪证据 → 放弃,不补计(宁漏勿误)', () => {
+    const sim = createSim();
+    setup(sim, STAND, ritualParams);
+    rampPose(sim, STAND, BOW, 12, ritualParams);
+    feed(sim, BOW, 12, ritualParams);
+    feed(sim, null, 400, ritualParams); // 消失约 13.2s > phaseTimeoutMs
+    expect(sim.state.phase).toBe('AWAIT_SETUP');
+    expect(sim.state.lastFinishReason).toBe('abandoned');
+    feed(sim, STAND, 100, ritualParams); // 回来站好:只重新武装,不补计
+    expect(sim.counted).toBe(0);
+    expect(sim.backfilled).toBe(0);
+  });
+
+  it('挂起超时 60s 无人 → 放弃,回安置期', () => {
+    const sim = createSim();
+    setup(sim, STAND_FULL, ritualParams);
+    rampPose(sim, STAND_FULL, BOW_FULL, 12, ritualParams);
+    feed(sim, BOW_FULL, 12, ritualParams);
+    rampPose(sim, BOW_FULL, KNEEL_FULL, 10, ritualParams);
+    feed(sim, KNEEL_FULL, 12, ritualParams);
+    feed(sim, null, 90, ritualParams);
+    expect(sim.state.phase).toBe('SUSPENDED');
+    feed(sim, null, 1900, ritualParams); // 约 63s > suspendTimeoutMs
+    expect(sim.state.phase).toBe('AWAIT_SETUP');
+    expect(sim.counted).toBe(0);
+    expect(sim.backfilled).toBe(0);
+  });
+
+  it('补计后立刻可以正常开始并完成下一拜(周期隔离)', () => {
+    const sim = createSim();
+    setup(sim, STAND_FULL, ritualParams);
+    rampPose(sim, STAND_FULL, BOW_FULL, 12, ritualParams);
+    feed(sim, BOW_FULL, 12, ritualParams);
+    rampPose(sim, BOW_FULL, KNEEL_FULL, 10, ritualParams);
+    feed(sim, KNEEL_FULL, 12, ritualParams);
+    feed(sim, null, 90, ritualParams);
+    feed(sim, STAND_FULL, 60, ritualParams);
+    expect(sim.backfilled).toBe(1);
+    // 下一拜走正常路径
+    rampPose(sim, STAND_FULL, BOW_FULL, 12, ritualParams);
+    feed(sim, BOW_FULL, 12, ritualParams);
+    rampPose(sim, BOW_FULL, KNEEL_FULL, 10, ritualParams);
+    feed(sim, KNEEL_FULL, 12, ritualParams);
+    rampPose(sim, KNEEL_FULL, PROSTRATE, 10, ritualParams);
+    feed(sim, PROSTRATE, 35, ritualParams);
+    rampPose(sim, PROSTRATE, STAND_FULL, 15, ritualParams);
+    feed(sim, STAND_FULL, 25, ritualParams);
+    expect(sim.counted + sim.backfilled).toBe(2);
+  });
+});
