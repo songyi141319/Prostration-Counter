@@ -307,6 +307,150 @@ function handleArmed(
   }
 }
 
+function toSuspended(next: PoseEngineState, now: number): void {
+  next.phase = 'SUSPENDED';
+  next.phaseStartedAt = now;
+  next.suspendedAt = now;
+}
+
+function handleBow(
+  next: PoseEngineState,
+  now: number,
+  params: PoseEngineParams,
+): FinishReason | null {
+  if (next.label === 'kneeling') {
+    next.evidenceKneeled = true;
+    next.phase = 'KNEEL';
+    next.phaseStartedAt = now;
+    return null;
+  }
+  if (next.label === 'standing') {
+    if (next.bowReturnedAt === null) {
+      next.bowReturnedAt = next.labelSince;
+    }
+    if (now - next.bowReturnedAt >= params.bowReturnGraceMs) {
+      // 弯腰后宽限窗内无下沉:单独问讯,拒计
+      return 'rejected';
+    }
+  } else {
+    next.bowReturnedAt = null;
+  }
+  if (now - next.phaseStartedAt >= params.phaseTimeoutMs) {
+    // 无下跪证据即长时间无进展(含弯腰后消失):宁漏勿误,放弃
+    return 'abandoned';
+  }
+  return null;
+}
+
+function handleKneel(
+  next: PoseEngineState,
+  now: number,
+  params: PoseEngineParams,
+): FinishReason | null {
+  if (next.label === 'prostrate') {
+    next.phase = 'BOTTOM';
+    next.phaseStartedAt = now;
+    return null;
+  }
+  if (next.label === 'standing' && now - next.labelSince >= params.standConfirmMs) {
+    // 跪了又直接起身,没磕头:不是完整一拜
+    return 'rejected';
+  }
+  if (next.label === 'absent') {
+    if (next.baseline?.fieldOfView === 'upper') {
+      // 上半身视野:跪后消失符合趴底消失签名 → 视作到底(被遮挡形态)
+      next.occludedBottom = true;
+      next.phase = 'BOTTOM';
+      next.phaseStartedAt = now;
+      return null;
+    }
+    if (now - next.labelSince >= params.absentToSuspendMs) {
+      toSuspended(next, now);
+      return null;
+    }
+  }
+  if (now - next.phaseStartedAt >= params.phaseTimeoutMs) {
+    // 已有下跪证据:转挂起等待回站确认,而非直接放弃
+    toSuspended(next, now);
+  }
+  return null;
+}
+
+function handleBottom(
+  next: PoseEngineState,
+  now: number,
+  params: PoseEngineParams,
+): FinishReason | null {
+  if (next.label === 'kneeling' || next.label === 'standing' || next.label === 'bowing') {
+    next.phase = 'RISE';
+    next.phaseStartedAt = now;
+    return null;
+  }
+  // prostrate / absent / transition 都属于趴底中(磕长头允许长停留)
+  if (now - next.phaseStartedAt >= params.bottomTimeoutMs) {
+    toSuspended(next, now);
+  }
+  return null;
+}
+
+function handleRise(
+  next: PoseEngineState,
+  now: number,
+  params: PoseEngineParams,
+): FinishReason | null {
+  if (next.label === 'standing' && now - next.labelSince >= params.standConfirmMs) {
+    const longEnough = next.cycleStartAt !== null && now - next.cycleStartAt >= params.minCycleMs;
+    return longEnough ? 'completed' : 'rejected';
+  }
+  if (next.label === 'prostrate') {
+    next.phase = 'BOTTOM';
+    next.phaseStartedAt = now;
+    return null;
+  }
+  if (next.label === 'absent' && now - next.labelSince >= params.absentToSuspendMs) {
+    toSuspended(next, now);
+    return null;
+  }
+  if (now - next.phaseStartedAt >= params.phaseTimeoutMs) {
+    toSuspended(next, now);
+  }
+  return null;
+}
+
+function handleSuspended(
+  next: PoseEngineState,
+  now: number,
+  params: PoseEngineParams,
+): FinishReason | null {
+  // 挂起期间正常计数路径全部关闭,唯一出口:回站确认补计 / 超时放弃
+  if (next.label === 'standing' && now - next.labelSince >= params.backfillStandMs) {
+    return 'backfilled';
+  }
+  if (next.suspendedAt !== null && now - next.suspendedAt >= params.suspendTimeoutMs) {
+    return 'abandoned';
+  }
+  return null;
+}
+
+// 周期唯一出口:同一周期结构上只能终结一次(spec §9 防双计)
+function applyFinish(next: PoseEngineState, reason: FinishReason, now: number): void {
+  next.lastFinishReason = reason;
+  next.cycleStartAt = null;
+  next.bowReturnedAt = null;
+  next.evidenceKneeled = false;
+  next.occludedBottom = false;
+  next.suspendedAt = null;
+  if (reason === 'abandoned') {
+    // 人已不在或信号不可信:基线作废,重新安置
+    next.phase = 'AWAIT_SETUP';
+    next.baseline = null;
+    resetSetupSampling(next);
+  } else {
+    next.phase = 'ARMED';
+  }
+  next.phaseStartedAt = now;
+}
+
 function makeDebug(next: PoseEngineState, features: FrameFeatures): PoseEngineDebug {
   const gap =
     features.headY !== null && features.shoulderY !== null
@@ -339,6 +483,7 @@ export function advancePoseSequence(
   const cleaned = cleanFeatures(next, extractFrameFeatures(landmarks), params);
   updateLabel(next, cleaned, now, params);
 
+  let finish: FinishReason | null = null;
   switch (next.phase) {
     case 'AWAIT_SETUP':
       handleAwaitSetup(next, cleaned, now, params);
@@ -346,9 +491,30 @@ export function advancePoseSequence(
     case 'ARMED':
       handleArmed(next, cleaned, now, params);
       break;
-    default:
+    case 'BOW':
+      finish = handleBow(next, now, params);
+      break;
+    case 'KNEEL':
+      finish = handleKneel(next, now, params);
+      break;
+    case 'BOTTOM':
+      finish = handleBottom(next, now, params);
+      break;
+    case 'RISE':
+      finish = handleRise(next, now, params);
+      break;
+    case 'SUSPENDED':
+      finish = handleSuspended(next, now, params);
       break;
   }
 
-  return {state: next, counted: false, backfilled: false, debug: makeDebug(next, cleaned)};
+  let counted = false;
+  let backfilled = false;
+  if (finish !== null) {
+    applyFinish(next, finish, now);
+    counted = finish === 'completed';
+    backfilled = finish === 'backfilled';
+  }
+
+  return {state: next, counted, backfilled, debug: makeDebug(next, cleaned)};
 }

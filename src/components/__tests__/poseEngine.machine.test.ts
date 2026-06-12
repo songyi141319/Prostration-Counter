@@ -107,6 +107,18 @@ function setup(sim: Sim, pose: PoseSpec, params: PoseEngineParams) {
   feed(sim, pose, 70, params);
 }
 
+// 一次标准完整大拜:弯腰→跪→磕头→起身(总时长 ≈ 3.6s > minCycleMs)
+function fullRitualCycle(sim: Sim, params: PoseEngineParams) {
+  rampPose(sim, STAND, BOW, 12, params);
+  feed(sim, BOW, 12, params);
+  rampPose(sim, BOW, KNEEL, 10, params);
+  feed(sim, KNEEL, 12, params);
+  rampPose(sim, KNEEL, PROSTRATE, 10, params);
+  feed(sim, PROSTRATE, 35, params);
+  rampPose(sim, PROSTRATE, STAND, 15, params);
+  feed(sim, STAND, 25, params);
+}
+
 describe('advancePoseSequence · 安置期', () => {
   it('稳定站立约 2 秒后建立基线并武装', () => {
     const sim = createSim();
@@ -149,6 +161,28 @@ describe('advancePoseSequence · 安置期', () => {
     feed(sim, STAND, 90, ritualParams);
     expect(sim.state.phase).toBe('ARMED');
     expect(sim.counted).toBe(0);
+    expect(sim.backfilled).toBe(0);
+  });
+});
+
+describe('advancePoseSequence · ritual 完整序列', () => {
+  it('标准完整一拜计 1 次,周期出口回到 ARMED', () => {
+    const sim = createSim();
+    setup(sim, STAND, ritualParams);
+    fullRitualCycle(sim, ritualParams);
+    expect(sim.counted).toBe(1);
+    expect(sim.backfilled).toBe(0);
+    expect(sim.state.phase).toBe('ARMED');
+    expect(sim.state.lastFinishReason).toBe('completed');
+  });
+
+  it('连续三拜计 3 次', () => {
+    const sim = createSim();
+    setup(sim, STAND, ritualParams);
+    for (let i = 0; i < 3; i += 1) {
+      fullRitualCycle(sim, ritualParams);
+    }
+    expect(sim.counted).toBe(3);
     expect(sim.backfilled).toBe(0);
   });
 });
