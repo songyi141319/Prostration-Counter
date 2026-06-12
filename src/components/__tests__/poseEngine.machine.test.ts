@@ -311,3 +311,36 @@ describe('advancePoseSequence · 挂起与补计', () => {
     expect(sim.counted + sim.backfilled).toBe(2);
   });
 });
+
+describe('advancePoseSequence · 上半身视野与长趴底', () => {
+  it('上半身视野:跪后消失 → 遮挡到底 → 重现起身 → 正常计 1(非补计,且总增量恰 1)', () => {
+    const sim = createSim();
+    setup(sim, STAND, ritualParams); // upper 视野
+    rampPose(sim, STAND, BOW, 12, ritualParams);
+    feed(sim, BOW, 12, ritualParams);
+    rampPose(sim, BOW, KNEEL, 10, ritualParams);
+    feed(sim, KNEEL, 12, ritualParams);
+    feed(sim, null, 40, ritualParams); // 磕头出画约 1.3s
+    expect(sim.state.phase).toBe('BOTTOM');
+    feed(sim, KNEEL, 10, ritualParams); // 重现为跪姿(起身途中)
+    rampPose(sim, KNEEL, STAND, 12, ritualParams);
+    feed(sim, STAND, 25, ritualParams);
+    expect(sim.counted).toBe(1);
+    expect(sim.backfilled).toBe(0);
+    expect(sim.counted + sim.backfilled).toBe(1);
+  });
+
+  it('磕长头:趴底消失 60s(< bottomTimeout 90s)后起身 → 正常计 1', () => {
+    const sim = createSim();
+    setup(sim, STAND, ritualParams);
+    rampPose(sim, STAND, BOW, 12, ritualParams);
+    feed(sim, BOW, 12, ritualParams);
+    rampPose(sim, BOW, KNEEL, 10, ritualParams);
+    feed(sim, KNEEL, 12, ritualParams);
+    feed(sim, null, 1800, ritualParams); // 趴底约 59.4s
+    expect(sim.state.phase).toBe('BOTTOM');
+    feed(sim, STAND, 30, ritualParams); // 直接重现为站立
+    expect(sim.counted).toBe(1);
+    expect(sim.backfilled).toBe(0);
+  });
+});
