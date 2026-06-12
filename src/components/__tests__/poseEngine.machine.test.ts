@@ -186,3 +186,60 @@ describe('advancePoseSequence · ritual 完整序列', () => {
     expect(sim.backfilled).toBe(0);
   });
 });
+
+describe('advancePoseSequence · 拒计(宁漏勿误)', () => {
+  it('单独弯腰问讯(弯下→停留→直接回站)不计数 —— 问题 2 回归', () => {
+    const sim = createSim();
+    setup(sim, STAND, ritualParams);
+    rampPose(sim, STAND, BOW, 12, ritualParams);
+    feed(sim, BOW, 30, ritualParams); // 深弯腰停留约 1s
+    rampPose(sim, BOW, STAND, 12, ritualParams);
+    feed(sim, STAND, 130, ritualParams); // 回站超过宽限窗 3s
+    expect(sim.counted).toBe(0);
+    expect(sim.backfilled).toBe(0);
+    expect(sim.state.phase).toBe('ARMED');
+    expect(sim.state.lastFinishReason).toBe('rejected');
+  });
+
+  it('连续多次单独弯腰均不计数', () => {
+    const sim = createSim();
+    setup(sim, STAND, ritualParams);
+    for (let i = 0; i < 3; i += 1) {
+      rampPose(sim, STAND, BOW, 12, ritualParams);
+      feed(sim, BOW, 20, ritualParams);
+      rampPose(sim, BOW, STAND, 12, ritualParams);
+      feed(sim, STAND, 130, ritualParams);
+    }
+    expect(sim.counted).toBe(0);
+  });
+
+  it('问讯后回直,宽限窗内下跪 → 序列继续,完整一拜计 1(仪轨流程)', () => {
+    const sim = createSim();
+    setup(sim, STAND, ritualParams);
+    rampPose(sim, STAND, BOW, 12, ritualParams);
+    feed(sim, BOW, 15, ritualParams);
+    rampPose(sim, BOW, STAND, 10, ritualParams);
+    feed(sim, STAND, 45, ritualParams); // 回直约 1.5s < 3s 宽限
+    rampPose(sim, STAND, KNEEL, 10, ritualParams);
+    feed(sim, KNEEL, 12, ritualParams);
+    rampPose(sim, KNEEL, PROSTRATE, 10, ritualParams);
+    feed(sim, PROSTRATE, 35, ritualParams);
+    rampPose(sim, PROSTRATE, STAND, 15, ritualParams);
+    feed(sim, STAND, 25, ritualParams);
+    expect(sim.counted).toBe(1);
+    expect(sim.backfilled).toBe(0);
+  });
+
+  it('跪下后未磕头直接起身 → 拒计', () => {
+    const sim = createSim();
+    setup(sim, STAND, ritualParams);
+    rampPose(sim, STAND, BOW, 12, ritualParams);
+    feed(sim, BOW, 12, ritualParams);
+    rampPose(sim, BOW, KNEEL, 10, ritualParams);
+    feed(sim, KNEEL, 20, ritualParams);
+    rampPose(sim, KNEEL, STAND, 12, ritualParams);
+    feed(sim, STAND, 30, ritualParams);
+    expect(sim.counted).toBe(0);
+    expect(sim.state.lastFinishReason).toBe('rejected');
+  });
+});
