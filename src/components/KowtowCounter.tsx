@@ -91,7 +91,7 @@ const PERSPECTIVE_MODE_OPTIONS: Array<{hint: string; label: string; value: Persp
 type EngineKind = 'smart' | 'classic';
 
 const ENGINE_OPTIONS: Array<{hint: string; label: string; value: EngineKind}> = [
-  {value: 'smart', label: '智能引擎', hint: '姿态序列验证,误计接近零(推荐)'},
+  {value: 'smart', label: '智能引擎', hint: '按姿态顺序确认完整动作（推荐）'},
   {value: 'classic', label: '经典引擎', hint: '深度门槛算法,兼容旧行为'},
 ];
 
@@ -383,8 +383,12 @@ export default function KowtowCounter() {
   const lastOrientationRef = useRef(false);
   const detectionStateRef = useRef<DetectionState>(createDetectionState(0));
   const poseStateRef = useRef<PoseEngineState>(createPoseEngineState(0));
-  const rotatedCanvasRef = useRef<OffscreenCanvas | null>(null);
+  const rotatedCanvasRef = useRef<OffscreenCanvas | HTMLCanvasElement | null>(null);
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
+  const cameraRequestRef = useRef(0);
+  const cameraStreamRef = useRef<MediaStream | null>(null);
+  const cameraAbortRef = useRef<AbortController | null>(null);
+  const backfillTimerRef = useRef<number | null>(null);
   const isBowedRef = useRef(false);
 
   const [viewport, setViewport] = useState(getViewportSize);
@@ -397,9 +401,11 @@ export default function KowtowCounter() {
   const [isBowed, setIsBowed] = useState(false);
   const [isReady, setIsReady] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
+  const [isStarting, setIsStarting] = useState(false);
   const [isCounting, setIsCounting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [reminderError, setReminderError] = useState<string | null>(null);
+  const [calibrationError, setCalibrationError] = useState<string | null>(null);
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState('');
   const [soundStyle, setSoundStyle] = useState<SoundStyle>('obvious');
@@ -602,6 +608,13 @@ export default function KowtowCounter() {
 
   const recalibrateMotionTracking = useCallback(
     (baseBodyY?: number, preserveBaselines = false) => {
+      poseStateRef.current = createPoseEngineState(performance.now());
+      setEnginePhase('AWAIT_SETUP');
+      setBackfillNotice(false);
+      if (backfillTimerRef.current !== null) {
+        window.clearTimeout(backfillTimerRef.current);
+        backfillTimerRef.current = null;
+      }
       const prevState = detectionStateRef.current;
       const fresh = createDetectionState(performance.now(), baseBodyY ?? null);
       detectionStateRef.current = preserveBaselines
@@ -613,6 +626,7 @@ export default function KowtowCounter() {
           }
         : fresh;
       setIsCalibrating(false);
+      setCalibrationError(null);
       updateBowed(false);
     },
     [updateBowed],
@@ -672,14 +686,14 @@ export default function KowtowCounter() {
   }, [isCounting]);
 
   const stopMediaTracks = useCallback(() => {
+    cameraRequestRef.current += 1;
+    cameraAbortRef.current?.abort();
+    cameraAbortRef.current = null;
     const video = videoRef.current;
-    if (!video?.srcObject) {
-      return;
-    }
-
-    const stream = video.srcObject as MediaStream;
-    stream.getTracks().forEach((track) => track.stop());
-    video.srcObject = null;
+    const stream = cameraStreamRef.current ?? (video?.srcObject as MediaStream | null);
+    stream?.getTracks().forEach((track) => track.stop());
+    cameraStreamRef.current = null;
+    if (video) video.srcObject = null;
   }, []);
 
   const getVideoConstraints = useCallback(
@@ -693,12 +707,15 @@ export default function KowtowCounter() {
   );
 
   const refreshDevices = useCallback(async (activeOnly = false) => {
-    const allDevices = await navigator.mediaDevices.enumerateDevices();
-    const videoDevices = allDevices.filter((device) => device.kind === 'videoinput');
-    setDevices(videoDevices);
-
-    if (!activeOnly && videoDevices.length > 0) {
-      setSelectedDeviceId((current) => current || videoDevices[0].deviceId);
+    try {
+      const allDevices = await navigator.mediaDevices.enumerateDevices();
+      const videoDevices = allDevices.filter((device) => device.kind === 'videoinput');
+      setDevices(videoDevices);
+      if (!activeOnly && videoDevices.length > 0) {
+        setSelectedDeviceId((current) => current || videoDevices[0].deviceId);
+      }
+    } catch {
+      // 列表读取失败时仍允许使用默认摄像头，不将成功取流误报成失败。
     }
   }, []);
 
@@ -739,6 +756,7 @@ export default function KowtowCounter() {
     return () => {
       active = false;
       stopMediaTracks();
+      if (backfillTimerRef.current !== null) window.clearTimeout(backfillTimerRef.current);
       if (poseLandmarkerRef.current) {
         poseLandmarkerRef.current.close();
       }
@@ -755,46 +773,88 @@ export default function KowtowCounter() {
         return;
       }
 
+      stopMediaTracks();
+      const requestId = cameraRequestRef.current;
+      const controller = new AbortController();
+      cameraAbortRef.current = controller;
+      const isCurrent = () => cameraRequestRef.current === requestId && videoRef.current === video;
+      let cleanMetadata = () => {};
+      setIsStarting(true);
+      setIsRunning(false);
       setError(null);
       setIsCounting(false);
       resetMotionTracking();
-      stopMediaTracks();
-      await ensureAudioContext();
 
       try {
-        const metadataLoaded = new Promise<void>((resolve) => {
-          video.onloadedmetadata = () => {
-            resolve();
-          };
-        });
-
+        await ensureAudioContext();
+        if (!isCurrent()) return;
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: false,
           video: getVideoConstraints(deviceId),
         });
-
+        if (!isCurrent()) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+        cameraStreamRef.current = stream;
+        const metadataLoaded = new Promise<void>((resolve, reject) => {
+          const loaded = () => resolve();
+          const failed = () => reject(new Error('摄像头画面加载失败。'));
+          const aborted = () => reject(new DOMException('摄像头开启已取消。', 'AbortError'));
+          const timeout = window.setTimeout(failed, 10000);
+          cleanMetadata = () => {
+            window.clearTimeout(timeout);
+            video.removeEventListener('loadedmetadata', loaded);
+            video.removeEventListener('error', failed);
+            controller.signal.removeEventListener('abort', aborted);
+          };
+          video.addEventListener('loadedmetadata', loaded);
+          video.addEventListener('error', failed);
+          controller.signal.addEventListener('abort', aborted);
+        });
         video.srcObject = stream;
         await metadataLoaded;
+        cleanMetadata();
+        if (!isCurrent()) return;
         await video.play();
+        if (!isCurrent()) return;
         setIsRunning(true);
         setIsCounting(resumeCounting);
-        await refreshDevices(true);
+        void refreshDevices(true);
       } catch (cameraError) {
+        if (!isCurrent()) return;
         console.error(cameraError);
+        stopMediaTracks();
         setError('无法访问摄像头，请确认权限已授予，或切换其他摄像头重试。');
         setIsRunning(false);
         setIsCounting(false);
-        }
+        setIsStarting(false);
+      } finally {
+        cleanMetadata();
+        if (isCurrent()) setIsStarting(false);
+      }
     },
     [ensureAudioContext, getVideoConstraints, refreshDevices, resetMotionTracking, stopMediaTracks],
   );
 
   const stopCamera = useCallback(() => {
     stopMediaTracks();
+    setIsStarting(false);
     setIsCounting(false);
     resetMotionTracking();
     setIsRunning(false);
   }, [resetMotionTracking, stopMediaTracks]);
+
+  const scheduleFrame = useCallback((callback: FrameRequestCallback) => {
+    return requestAnimationFrame((time) => {
+      try {
+        callback(time);
+      } catch {
+        stopCamera();
+        setError('画面处理异常，请重新开启摄像头后重试。');
+      }
+    });
+  }, [stopCamera]);
 
   const renderLoop = useCallback(() => {
     if (!isRunning || !videoRef.current || !canvasRef.current || !poseLandmarkerRef.current) {
@@ -817,7 +877,7 @@ export default function KowtowCounter() {
         canvas.height = frameH;
       }
 
-      let detectionSource: OffscreenCanvas | HTMLVideoElement = video;
+      let detectionSource: OffscreenCanvas | HTMLCanvasElement | HTMLVideoElement = video;
 
       if (isLandscapeStream) {
         if (
@@ -825,11 +885,16 @@ export default function KowtowCounter() {
           rotatedCanvasRef.current.width !== frameW ||
           rotatedCanvasRef.current.height !== frameH
         ) {
-          rotatedCanvasRef.current = new OffscreenCanvas(frameW, frameH);
+          const rotationCanvas = typeof OffscreenCanvas === 'function'
+            ? new OffscreenCanvas(frameW, frameH)
+            : document.createElement('canvas');
+          rotationCanvas.width = frameW;
+          rotationCanvas.height = frameH;
+          rotatedCanvasRef.current = rotationCanvas;
         }
         const offCtx = rotatedCanvasRef.current.getContext('2d');
         if (!offCtx) {
-          requestRef.current = requestAnimationFrame(renderLoop);
+          requestRef.current = scheduleFrame(renderLoop);
           return;
         }
         offCtx.clearRect(0, 0, frameW, frameH);
@@ -841,7 +906,14 @@ export default function KowtowCounter() {
         detectionSource = rotatedCanvasRef.current;
       }
 
-      const results = poseLandmarkerRef.current.detectForVideo(detectionSource, performance.now());
+      let results: ReturnType<PoseLandmarker['detectForVideo']>;
+      try {
+        results = poseLandmarkerRef.current.detectForVideo(detectionSource, performance.now());
+      } catch {
+        stopCamera();
+        setError('姿态识别中断，请重新开启摄像头后重试。');
+        return;
+      }
 
       if (context) {
         context.clearRect(0, 0, canvas.width, canvas.height);
@@ -888,7 +960,8 @@ export default function KowtowCounter() {
           }
           if (result.backfilled) {
             setBackfillNotice(true);
-            window.setTimeout(() => setBackfillNotice(false), 3000);
+            if (backfillTimerRef.current !== null) window.clearTimeout(backfillTimerRef.current);
+            backfillTimerRef.current = window.setTimeout(() => setBackfillNotice(false), 3000);
           }
           if (result.state.phase !== prevPhase) {
             setEnginePhase(result.state.phase);
@@ -918,7 +991,7 @@ export default function KowtowCounter() {
             }
             context.restore();
           }
-        } else if (isCounting || detectionStateRef.current.calibration) {
+        } else if (engine === 'classic' && (isCounting || detectionStateRef.current.calibration)) {
           const now = performance.now();
           const signal = computeBodySignal(results.landmarks?.[0] ?? null);
           const detectionParams: DetectionParams = {
@@ -959,6 +1032,10 @@ export default function KowtowCounter() {
           };
 
           const result = advanceDetection(detectionStateRef.current, signal, now, detectionParams);
+          if (detectionStateRef.current.calibration && !result.state.calibration) {
+            setIsCalibrating(false);
+            setCalibrationError(result.calibrated ? null : '未检测到清晰姿态，请站好后重新校准。');
+          }
           detectionStateRef.current = result.state;
 
           if (result.counted) {
@@ -999,12 +1076,12 @@ export default function KowtowCounter() {
       }
     }
 
-    requestRef.current = requestAnimationFrame(renderLoop);
-  }, [countMode, engine, isCounting, isRunning, perspectiveMode, playCountTickTone, previewMode, showDebug, tuning, updateBowed]);
+    requestRef.current = scheduleFrame(renderLoop);
+  }, [countMode, engine, isCounting, isRunning, perspectiveMode, playCountTickTone, previewMode, scheduleFrame, showDebug, stopCamera, tuning, updateBowed]);
 
   useEffect(() => {
     if (isRunning) {
-      requestRef.current = requestAnimationFrame(renderLoop);
+      requestRef.current = scheduleFrame(renderLoop);
     } else if (requestRef.current) {
       cancelAnimationFrame(requestRef.current);
     }
@@ -1014,7 +1091,7 @@ export default function KowtowCounter() {
         cancelAnimationFrame(requestRef.current);
       }
     };
-  }, [isRunning, renderLoop]);
+  }, [isRunning, renderLoop, scheduleFrame]);
 
   useEffect(() => {
     const previousCount = previousCountRef.current;
@@ -1121,8 +1198,6 @@ export default function KowtowCounter() {
 
     void ensureAudioContext();
     softResetMotionTracking();
-    poseStateRef.current = createPoseEngineState(performance.now());
-    setEnginePhase('AWAIT_SETUP');
     setIsCounting(true);
   };
 
@@ -1131,8 +1206,6 @@ export default function KowtowCounter() {
       return;
     }
     setEngine(nextEngine);
-    poseStateRef.current = createPoseEngineState(performance.now());
-    setEnginePhase('AWAIT_SETUP');
     resetMotionTracking();
   };
 
@@ -1142,14 +1215,20 @@ export default function KowtowCounter() {
     }
 
     void ensureAudioContext();
+    if (engine === 'smart') {
+      resetMotionTracking();
+      setIsSettingsOpen(false);
+      return;
+    }
+    setCalibrationError(null);
     detectionStateRef.current = startCalibration(detectionStateRef.current, performance.now());
     setIsCalibrating(true);
     setIsSettingsOpen(false);
   };
 
   const applyCustomTarget = () => {
-    const parsedTarget = Number.parseInt(customTargetInput, 10);
-    if (!Number.isInteger(parsedTarget) || parsedTarget < 1) {
+    const parsedTarget = Number(customTargetInput);
+    if (!Number.isSafeInteger(parsedTarget) || parsedTarget < 1) {
       setReminderError('自定义提醒次数请输入大于 0 的整数。');
       return;
     }
@@ -1312,6 +1391,11 @@ export default function KowtowCounter() {
                       校准中，请站好不动…
                     </div>
                   )}
+                  {calibrationError && (
+                    <div className="rounded-full border border-amber-400/50 bg-stone-950/90 px-3 py-1 text-xs text-amber-200">
+                      {calibrationError}
+                    </div>
+                  )}
                 </div>
 
                 <div
@@ -1363,7 +1447,7 @@ export default function KowtowCounter() {
                 {isCounting ? '暂停计数' : '开始计数'}
               </button>
 
-              {!isRunning ? (
+              {!isRunning && !isStarting ? (
                 <button
                   type="button"
                   onClick={startCamera}
@@ -1380,7 +1464,7 @@ export default function KowtowCounter() {
                   className="flex flex-1 items-center justify-center gap-2 rounded-2xl border border-red-500/20 bg-red-500/10 px-6 py-4 text-lg font-bold text-red-400 transition-all active:scale-95"
                 >
                   <CameraOff className="h-6 w-6" />
-                  关闭摄像头
+                  {isStarting ? '取消开启' : '关闭摄像头'}
                 </button>
               )}
 
@@ -1407,7 +1491,7 @@ export default function KowtowCounter() {
             </div>
             <p className="mt-3 text-xs leading-relaxed text-stone-400">
               {engine === 'smart'
-                ? '先开启摄像头，再点击“开始计数”，然后站到画面中保持站立约 2 秒（磕头模式保持跪坐），看到“已就绪”后开始礼拜。摆放手机期间不会误计。'
+                ? '先开启摄像头，再点击“开始计数”，然后站到画面中保持站立约 2 秒（磕头模式保持跪坐），看到“已就绪”后开始礼拜。清零或切换模式后，请重新保持预备姿态。'
                 : '先开启摄像头，再点击“开始计数”。识别不准时点“手动校准”，在镜头前站好（磕头模式保持跪坐）约 3 秒，听到木鱼音即校准完成。'}
             </p>
           </div>
@@ -1498,6 +1582,7 @@ export default function KowtowCounter() {
             <select
               value={selectedDeviceId}
               onChange={handleDeviceChange}
+              disabled={isStarting}
               className="w-full rounded-xl border border-stone-700 bg-stone-900 px-4 py-3 text-sm text-stone-100 outline-none"
             >
               {devices.length === 0 && <option value="">默认摄像头</option>}
@@ -1762,7 +1847,7 @@ export default function KowtowCounter() {
                 <div className="space-y-1">
                   <h3 className="text-lg font-bold text-stone-100">参数设置</h3>
                   <p className="text-sm text-stone-400">
-                    这里可以调整自动校准、动作阈值、解卡时间和每次计数的木鱼音效。修改后会立即生效。
+                    木鱼音效对两种引擎都生效。动作阈值和拍摄角度仅用于经典引擎，智能引擎会自动准备姿态。
                   </p>
                 </div>
                 <button
@@ -1825,6 +1910,7 @@ export default function KowtowCounter() {
                   <button
                     type="button"
                     onClick={resetTuningSettings}
+                    disabled={engine !== 'classic'}
                     className="rounded-xl border border-stone-700 bg-stone-800 px-4 py-3 text-sm font-semibold text-stone-100 transition-colors active:scale-95"
                   >
                     恢复默认参数
@@ -1842,11 +1928,11 @@ export default function KowtowCounter() {
                     disabled={!isRunning}
                     className="rounded-xl border border-amber-400/30 bg-amber-400/10 px-4 py-3 text-sm font-semibold text-amber-100 transition-colors active:scale-95 disabled:opacity-40"
                   >
-                    校准站立基线（站好 2 秒）
+                    {engine === 'smart' ? '重新准备姿态' : '校准站立基线（站好 2 秒）'}
                   </button>
                 </div>
 
-                {TUNING_SECTIONS.map((section) => (
+                {engine === 'classic' && TUNING_SECTIONS.map((section) => (
                   <div
                     key={section.title}
                     className="rounded-2xl border border-stone-800 bg-stone-950/60 p-4"
@@ -1893,13 +1979,13 @@ export default function KowtowCounter() {
                   </div>
                 ))}
 
-                <div className="rounded-2xl border border-amber-500/20 bg-amber-500/10 p-4 text-xs leading-relaxed text-amber-100">
+                {engine === 'classic' && <div className="rounded-2xl border border-amber-500/20 bg-amber-500/10 p-4 text-xs leading-relaxed text-amber-100">
                   <div className="mb-2 font-semibold">调整建议</div>
                   <p>竖版识别不到：先把“自动校准间隔”调小，或把当前拍摄角度下的“最小幅度”调小一点。</p>
                   <p className="mt-2">次数多了后变钝：优先调小“自动校准间隔”，或调小“稳定帧数”；如果会卡住，再调小“解卡超时”。</p>
                   <p className="mt-2">浅动作也被算进去：把对应模式的“最小幅度”调大，或把“到底宽松度”调小。</p>
                   <p className="mt-2">已经明显到底但不计数：把“到底宽松度”调大，或把“起身恢复宽松度”稍微调大。</p>
-                </div>
+                </div>}
               </div>
             </div>
           </div>

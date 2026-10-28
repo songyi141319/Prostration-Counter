@@ -28,11 +28,14 @@ Set-Content -Path $localProperties -Value "sdk.dir=$sdkDir"
 Push-Location $repoRoot
 try {
   npm run build
+  if ($LASTEXITCODE -ne 0) { throw "Web build failed. Android packaging stopped." }
   npx cap sync android
+  if ($LASTEXITCODE -ne 0) { throw "Android resource sync failed. Packaging stopped." }
 
   Push-Location $androidDir
   try {
     .\gradlew.bat assembleDebug
+    if ($LASTEXITCODE -ne 0) { throw "Android package build failed." }
   } finally {
     Pop-Location
   }
